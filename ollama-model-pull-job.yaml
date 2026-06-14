@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-model-pull
+spec:
+  template:
+    spec:
+      containers:
+      - name: model-puller
+        image: ollama/ollama:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            ollama pull llama3 &&
+            ollama pull nomic-embed-text
+        env:
+        - name: OLLAMA_HOST
+          value: "http://ollama:11434"
+      restartPolicy: OnFailure

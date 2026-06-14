@@ -1,6 +1,6 @@
 import requests
 
-OLLAMA_URL = "http://localhost:11434/api"
+OLLAMA_URL = "http://ollama:11434/api"
 
 def embed_text(text: str) -> list:
     response = requests.post(
