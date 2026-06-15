@@ -42,3 +42,17 @@ def ask(request: AskRequest):
         "answer": result["answer"],
         "retrieved_chunks": result["retrieved_chunks"]
     }
+
+from app.agent import run_agent
+
+class AgentRequest(BaseModel):
+    question: str
+
+@app.post("/agent")
+def agent_ask(request: AgentRequest):
+    answer = run_agent(request.question)
+    return {
+        "question": request.question,
+        "route": "langgraph_agent",
+        "answer": answer
+    }

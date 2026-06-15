@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ollama-model-pull
+  name: ollama-model-pull-v2
 spec:
   template:
     spec:
@@ -12,7 +12,8 @@ spec:
         args:
           - |
             ollama pull llama3 &&
-            ollama pull nomic-embed-text
+            ollama pull nomic-embed-text &&
+            ollama pull llama3.1
         env:
         - name: OLLAMA_HOST
           value: "http://ollama:11434"

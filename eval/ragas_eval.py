@@ -1,9 +1,17 @@
 from ragas import evaluate
 from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_community.llms import Ollama
+from langchain_community.embeddings import OllamaEmbeddings
 from datasets import Dataset
 import requests
 
 BASE_URL = "http://localhost:8000"
+
+# Point RAGAS at your local Ollama instead of OpenAI
+llm = LangchainLLMWrapper(Ollama(base_url="http://localhost:11434", model="llama3"))
+embeddings = LangchainEmbeddingsWrapper(OllamaEmbeddings(base_url="http://localhost:11434", model="nomic-embed-text"))
 
 eval_questions = [
     {
@@ -53,7 +61,9 @@ dataset = Dataset.from_dict({
 
 results = evaluate(
     dataset,
-    metrics=[faithfulness, answer_relevancy, context_precision, context_recall]
+    metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+    llm=llm,
+    embeddings=embeddings
 )
 
 print(results)
