@@ -4,3 +4,4 @@ chromadb
 requests
 pypdf
 pydantic
+python-multipart

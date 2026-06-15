@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from app.rag import ingest_document, ask_private_docs
+import os
 
 app = FastAPI()
 
@@ -17,6 +18,20 @@ def health_check():
 @app.post("/ingest")
 def ingest(request: IngestRequest):
     return ingest_document(request.file_path)
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    temp_path = f"/tmp/{file.filename}"
+    contents = await file.read()
+    with open(temp_path, "wb") as f:
+        f.write(contents)
+    result = ingest_document(temp_path)
+    os.remove(temp_path)
+    return {
+        "filename": file.filename,
+        "chunks_added": result["chunks_added"],
+        "status": "ingested"
+    }
 
 @app.post("/ask")
 def ask(request: AskRequest):
