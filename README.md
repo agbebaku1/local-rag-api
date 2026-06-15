@@ -500,7 +500,7 @@ curl -X POST http://localhost:8000/ask \
 - [x] ChromaDB as StatefulSet with PVC
 - [x] File upload endpoint
 - [x] Automated model pulling via K8s Job
-- [ ] RAGAS evaluation scoring
+- [x] RAGAS evaluation scoring
 - [ ] Deploy to EKS
 - [ ] File upload frontend
 - [ ] S3 storage for raw documents
