@@ -1,7 +1,7 @@
 import chromadb
 from app.ollama_client import embed_text, ask_llama
 
-client = chromadb.PersistentClient(path="./chroma_db")
+client = chromadb.HttpClient(host="chroma", port=8000)
 collection = client.get_or_create_collection(name="private_docs")
 
 def chunk_text(text: str, chunk_size: int = 300) -> list:
