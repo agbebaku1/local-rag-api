@@ -4,6 +4,8 @@ metadata:
   name: ollama
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ollama
@@ -12,16 +14,31 @@ spec:
       labels:
         app: ollama
     spec:
+      initContainers:
+      - name: pull-models
+        image: ollama/ollama:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            ollama serve &
+            OLLAMA_PID=$!
+            sleep 5
+            ollama pull llama3 || true
+            ollama pull nomic-embed-text || true
+            ollama pull llama3.1 || true
+            kill $OLLAMA_PID || true
+            exit 0
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
       containers:
       - name: ollama
         image: ollama/ollama:latest
         ports:
         - containerPort: 11434
-        resources:
-          requests:
-            memory: "4Gi"
-          limits:
-            memory: "8Gi"
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
         startupProbe:
           httpGet:
             path: /api/tags
@@ -43,6 +60,21 @@ spec:
           initialDelaySeconds: 60
           periodSeconds: 30
           failureThreshold: 3
+      volumes:
+      - name: ollama-data
+        persistentVolumeClaim:
+          claimName: ollama-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
 ---
 apiVersion: v1
 kind: Service

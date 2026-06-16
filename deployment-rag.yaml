@@ -18,4 +18,21 @@ spec:
         imagePullPolicy: Never
         ports:
         - containerPort: 8000
-      
+        env:
+        - name: CHROMA_HOST
+          value: "chroma"
+        - name: RAG_CHROMA_PORT
+          value: "8000"
+        - name: OLLAMA_HOST
+          value: "http://ollama:11434"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-app
+spec:
+  selector:
+    app: rag-app
+  ports:
+    - port: 8000
+      targetPort: 8000

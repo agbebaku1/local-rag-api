@@ -6,3 +6,6 @@ pypdf
 pydantic
 python-multipart
 python-multipart
+langgraph
+langchain-ollama
+langchain-core
