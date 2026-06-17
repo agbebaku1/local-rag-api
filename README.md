@@ -15,6 +15,8 @@ PDF/TXT Upload
       ↓
 FastAPI
       ↓
+Idempotency check (content_hash) — skip if already ingested
+      ↓
 Chunking (300 char chunks)
       ↓
 Embeddings (nomic-embed-text)
@@ -39,6 +41,7 @@ Real use cases this is aimed at:
 
 - PDF and text document ingestion
 - File upload endpoint for dynamic ingestion
+- **Idempotent ingestion** — uploading the same document content twice does not duplicate vectors, detected via SHA-256 content hash, independent of filename
 - Semantic search using vector embeddings, explicit cosine similarity metric
 - ChromaDB as a StatefulSet with persistent storage
 - Local LLM inference via Ollama
@@ -46,7 +49,7 @@ Real use cases this is aimed at:
 - LangGraph agent with tool-calling, temperature tuned for faithful generation
 - Source citations on every answer (`/ask` and `/agent`)
 - Agent grounding verification (`tool_was_called`) — proves the agent actually queried documents instead of answering from training data
-- Metadata-aware retrieval — chunks tagged with `document_name` and `chunk_index`, queries filterable to a single document
+- Metadata-aware retrieval — chunks tagged with `document_name`, `chunk_index`, and `content_hash`; queries filterable to a single document
 - Document registry endpoint (`/documents`)
 - Retrieval debugging endpoint (`/debug-search`) — inspect raw retrieval before generation, to separate retrieval failures from generation failures
 - RAGAS evaluation framework
@@ -102,7 +105,7 @@ local-rag-api/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              ← FastAPI routes
-│   ├── rag.py                ← RAG pipeline, metadata-aware retrieval, debug search
+│   ├── rag.py                ← RAG pipeline, idempotent ingestion, metadata-aware retrieval, debug search
 │   ├── agent.py               ← LangGraph agent, temperature=0
 │   ├── ollama_client.py        ← Ollama API calls
 │   └── data/
@@ -129,7 +132,7 @@ local-rag-api/
 ```
 GET  /              → health check
 POST /ingest         → ingest a file already inside the container
-POST /upload          → upload a PDF, system ingests it
+POST /upload          → upload a PDF, system ingests it (idempotent)
 POST /ask              → ask a question, deterministic retrieval, always searches
 POST /agent              → ask a question, LLM decides whether to call the search tool
 POST /debug-search        → inspect raw retrieval, no generation involved
@@ -142,11 +145,17 @@ GET  /documents             → list every document currently indexed
 chunk_text()
   → splits raw text into fixed 300-character chunks
 
+content_hash()
+  → SHA-256 hash of a document's full text, truncated to 16 hex characters
+  → used as a content fingerprint, independent of filename
+
 ingest_document()
   → reads the file (PDF via pypdf, or plain text)
-  → chunks it
-  → sends each chunk to Ollama for embedding
-  → stores chunk + embedding + metadata (source, document_name, chunk_index) in Chroma
+  → computes content_hash(text)
+  → checks Chroma for an existing chunk with that content_hash
+  → if found: returns immediately with status "skipped_duplicate", no new chunks added
+  → if not found: chunks the text, embeds each chunk via Ollama,
+    stores chunk + embedding + metadata (source, document_name, chunk_index, content_hash) in Chroma
 
 ask_private_docs()
   → embeds the question
@@ -159,6 +168,8 @@ debug_search()
   → same retrieval as ask_private_docs(), but stops before generation
   → returns raw chunks, metadata, and scores
   → exists specifically to isolate retrieval failures from generation failures
+  → this is the endpoint that caught both idempotency bugs below — it showed
+    the raw stored metadata directly, instead of guessing from a confusing API response
 ```
 
 ### agent.py — The Decision-Maker
@@ -187,6 +198,27 @@ Stores chunks as vectors. A question gets converted to a vector too, and Chroma 
 
 ## Key Engineering Decisions and Bugs Found
 
+### Idempotent Ingestion via content_hash
+
+**The feature:** `ingest_document()` computes a SHA-256 hash of a document's full text (truncated to 16 hex characters) and stores it as `content_hash` in every chunk's metadata. Before chunking, it checks Chroma for any existing chunk with that same hash. If found, it returns immediately with `{"chunks_added": 0, "status": "skipped_duplicate"}` and adds nothing. This means re-uploading the exact same content — even under a different filename — does not duplicate vectors.
+
+**Bug found while testing it — stale records have no hash to match against.** First test re-uploaded a PDF that had already been ingested multiple times across earlier sessions, *before* `content_hash` existed in the code. Expected `skipped_duplicate`; got `chunks_added: 19` instead — a real duplicate add. `/debug-search` confirmed why: the existing chunks in Chroma had no `content_hash` field in their metadata at all, since they predated this code. The duplicate check ran correctly and found nothing to match, because there was genuinely nothing to match against. This is the exact same lesson as the earlier metadata-schema migration, recurring on a different field: changing ingestion code does not retroactively update records already written to the database. Fixed for dev purposes with a volume wipe and clean re-ingest (`docker compose down -v`), which is acceptable for disposable dev data but is explicitly not the production answer — see the versioned-collection note below.
+
+**Bug found immediately after — correct backend result, mislabeled by the API.** After the wipe and re-ingest, uploading the same file a second time correctly added 0 chunks, but the `/upload` response said `"status": "ingested"` instead of `"status": "skipped_duplicate"`. Root cause: `ingest_document()`'s duplicate-skip path does return a `status` key, but `main.py`'s `/upload` route was hardcoding `"status": "ingested"` in its own response dict, never reading `result["status"]` at all. The underlying idempotency logic was correct the whole time; the API layer was just overwriting the truth. Fixed in `main.py` by changing the hardcoded value to `result.get("status", "ingested")` — reads the real status when `ingest_document` provides one, falls back to `"ingested"` for the normal path where no `status` key exists.
+
+**Verified, end to end, with real command output:**
+```bash
+# First upload of a brand-new document under the new schema
+curl -F "file=@Reggie_MGC_Trading_Strategy.pdf" http://localhost:8000/upload
+# {"chunks_added": 19, "status": "ingested"}
+
+# Same file, uploaded again immediately
+curl -F "file=@Reggie_MGC_Trading_Strategy.pdf" http://localhost:8000/upload
+# {"chunks_added": 0, "status": "skipped_duplicate"}
+```
+
+**Known, deliberate scope limit — not yet decided either way:** chunk IDs are still `f"{file_path}-{index}"`, not hash-based. If someone edits a file in place and re-ingests under the same filename with different content, the old chunks get silently overwritten rather than versioned. This is a different problem than the one just solved (same content / different filename) and was deliberately left alone rather than expanding scope mid-feature.
+
 ### Distance Metric: Cosine vs L2
 
 Chroma defaults to L2 distance, not cosine similarity. Computing `relevance_score = 1 - distance` against raw L2 distances on un-normalized embeddings produced meaningless values — observed in testing as large negative numbers (e.g. -345). Fixed by explicitly setting the metric at collection creation:
@@ -198,7 +230,7 @@ collection = client.get_or_create_collection(
 )
 ```
 
-This only applies to new collections — Chroma won't change the metric on an existing one in place, which is part of why a metadata schema change later (below) required a fresh collection rather than an in-place fix.
+This only applies to new collections — Chroma won't change the metric on an existing one in place, which is part of why a metadata schema change later required a fresh collection rather than an in-place fix.
 
 ### Generation Inconsistency: Temperature Tuning
 
@@ -214,9 +246,9 @@ llm = ChatOllama(
 
 Confirmed consistent, grounded answers across repeated runs after the change.
 
-### Metadata Schema Migration
+### Metadata Schema Migration (original instance, before content_hash)
 
-After adding `document_name` and `chunk_index` to chunk metadata, chunks ingested before that change still carried the old schema (`{"source": file_path}` only) and did not update retroactively — `/debug-search` surfaced this directly, showing `document_name: null` on stale records. Changing ingestion code doesn't change records already written to the database.
+After adding `document_name` and `chunk_index` to chunk metadata, chunks ingested before that change still carried the old schema (`{"source": file_path}` only) and did not update retroactively — `/debug-search` surfaced this directly, showing `document_name: null` on stale records.
 
 Since this was disposable development data, the practical fix was a volume reset and clean re-ingest:
 
@@ -237,7 +269,7 @@ collection = client.get_or_create_collection(
 
 with a migration flow of: keep the old collection live → create `private_docs_v2` with the corrected schema → re-index all source documents from S3 → validate via `/debug-search` → cut the app over via the `COLLECTION_NAME` env var → monitor → delete the old collection later.
 
-**Status: this is a stated, designed strategy, not a built one.** The `private_docs_v2` cutover has not actually been implemented or tested — worth being precise about that distinction rather than claiming it as done.
+**Status: this is a stated, designed strategy, not a built one.** The `private_docs_v2` cutover has not actually been implemented or tested. Worth noting this exact pattern has now recurred twice (once for `document_name`/`chunk_index`, once for `content_hash`) — a real, recurring argument for actually building the versioned-collection pattern instead of continuing to wipe dev data each time a schema changes.
 
 ### The PORT Environment Variable Conflict
 
@@ -368,7 +400,7 @@ Question 2: PASS
 Retrieval Accuracy: 100%
 ```
 
-**Honest scope note:** this is currently 2 test cases — a smoke test confirming the harness works, not a real evaluation suite. A defensible version needs more cases, including ones designed to fail (e.g. asking a policy-specific question while only the trading PDF is loaded), to actually prove the harness can detect a wrong match rather than only ever seeing easy correct ones. Not done yet.
+**Honest scope note:** this is currently 2 test cases — a smoke test confirming the harness works, not a real evaluation suite. A defensible version needs more cases, including ones designed to fail (e.g. asking a policy-specific question while only the trading PDF is loaded), to actually prove the harness can detect a wrong match rather than only ever seeing easy correct ones. Not done yet. Also note: this has only ever been run with one document loaded in the collection — the `document_name` filtering logic has never actually been exercised against more than one candidate document.
 
 ---
 
@@ -381,9 +413,11 @@ curl http://localhost:8000/
 ```
 
 ### `POST /upload`
+Idempotent — uploading the same content twice returns `chunks_added: 0, status: skipped_duplicate` on the second call.
 ```bash
 curl -F "file=@contract.pdf" http://localhost:8000/upload
-# {"filename": "contract.pdf", "chunks_added": 39, "status": "ingested"}
+# First time:  {"filename": "contract.pdf", "chunks_added": 39, "status": "ingested"}
+# Second time: {"filename": "contract.pdf", "chunks_added": 0, "status": "skipped_duplicate"}
 ```
 
 ### `POST /ingest`
@@ -522,6 +556,7 @@ Note: the LangGraph agent (`/agent`) is memory-constrained under Kind on machine
 ### Built
 - End-to-end private RAG system from scratch
 - File upload endpoint for dynamic ingestion
+- Idempotent ingestion via SHA-256 content hashing
 - ChromaDB StatefulSet with persistent volume, explicit cosine distance metric
 - Ollama with declarative model pulling via init container
 - LangGraph agent wrapping RAG as a tool, temperature tuned for faithful generation
@@ -546,9 +581,11 @@ Note: the LangGraph agent (`/agent`) is memory-constrained under Kind on machine
 - Memory constraints for LLM inference in containerized environments
 - RAGAS metrics and what each one actually measures
 - Cosine vs L2 distance, and why the metric must be set explicitly at collection creation
-- Why changing ingestion code does not retroactively change already-stored vector records, and why production handles this with a versioned collection and re-index rather than a destructive wipe
+- Why changing ingestion code does not retroactively change already-stored vector records, and why this is a recurring pattern (hit twice now), and why production handles it with a versioned collection and re-index rather than a destructive wipe
+- Why a correct backend result can still be misreported by an API layer that hardcodes a response field instead of reading what the underlying function actually returned
 - Sampling temperature's effect on RAG faithfulness
 - Why container filesystem paths must be used instead of local machine paths
+- Python syntax fundamentals exercised directly while building this feature: module imports (`import hashlib`), method chaining (`.encode().hexdigest()`), string slicing (`[:16]`), dict literals as query filters (`where={"key": value}`), dict `.get()` with a default value to avoid `KeyError`, list truthiness in `if` checks, and why a missing trailing comma in a multi-line dict produces a misleading `SyntaxError` on the following line
 
 ---
 
@@ -557,10 +594,11 @@ Note: the LangGraph agent (`/agent`) is memory-constrained under Kind on machine
 **Done, verified:**
 - [x] Local RAG pipeline
 - [x] PDF ingestion
+- [x] Idempotent ingestion via `content_hash` — built, tested, two real bugs found and fixed, verified with real command output
 - [x] Vector search with ChromaDB, cosine metric
 - [x] Source citations
 - [x] Agent tool telemetry (`tool_was_called`)
-- [x] Metadata-aware retrieval (`document_name`, `chunk_index`)
+- [x] Metadata-aware retrieval (`document_name`, `chunk_index`, `content_hash`)
 - [x] Document registry endpoint (`/documents`)
 - [x] Retrieval debugging endpoint (`/debug-search`)
 - [x] Temperature tuning for generation consistency
@@ -570,10 +608,11 @@ Note: the LangGraph agent (`/agent`) is memory-constrained under Kind on machine
 - [x] RAGAS evaluation scoring (on `/ask`, HR policy doc)
 - [x] Retrieval-accuracy harness (smoke-test scale, 2 cases)
 
-**Designed, not yet built:**
-- [ ] Idempotent ingestion via `content_hash` — prevents duplicate vectors on re-upload of the same document under a different filename. Helper function and duplicate-check logic scoped; not yet written into `app/rag.py`.
-- [ ] Versioned-collection migration pattern (`private_docs_v2` + `COLLECTION_NAME` env var cutover) — strategy is sound and documented above, implementation not started
-- [ ] Expand retrieval-accuracy harness beyond 2 cases, including cases designed to fail
+**Designed, not yet built — pick up here next session:**
+- [ ] Versioned-collection migration pattern (`private_docs_v2` + `COLLECTION_NAME` env var cutover) — strategy is sound and documented above, implementation not started. Now has two real recurring incidents motivating it (document_name/chunk_index migration, then content_hash migration).
+- [ ] Load a second document (e.g. `policy.txt`) alongside the trading PDF and actually exercise the `document_name` filter on `/ask` and `/debug-search` — this logic exists in code but has never been tested with more than one document in the collection
+- [ ] Expand `evaluate_retrieval.py` beyond 2 cases, including cases designed to fail (e.g. a policy-only question while only the trading PDF is loaded), to prove the harness can actually detect a wrong match
+- [ ] Decide on and possibly implement hash-based chunk IDs (currently still `f"{file_path}-{index}"`) — relevant if a file gets edited in place and re-ingested under the same filename
 - [ ] Extend RAGAS evaluation to cover `/agent` and the trading-strategy document
 
 **Not started:**

@@ -40,7 +40,7 @@ async def upload_file(file: UploadFile = File(...)):
         "filename": file.filename,
         "document_name": result["document_name"],
         "chunks_added": result["chunks_added"],
-        "status": "ingested"
+        "status": result.get("status", "ingested")
     }
 
 @app.post("/ask")

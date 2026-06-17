@@ -1,6 +1,7 @@
 import os
 import chromadb
 from app.ollama_client import embed_text, ask_llama
+import hashlib
 
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chroma")
 CHROMA_PORT = 8000
@@ -15,6 +16,12 @@ collection = client.get_or_create_collection(
 def chunk_text(text: str, chunk_size: int = 300) -> list:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def ingest_document(file_path: str):
     if file_path.endswith(".pdf"):
         from pypdf import PdfReader
@@ -27,6 +34,16 @@ def ingest_document(file_path: str):
     else:
         with open(file_path, "r") as f:
             text = f.read()
+    doc_hash = content_hash(text)
+
+    existing = collection.get(where={"content_hash": doc_hash}, limit=1)
+    if existing.get("ids"):
+        return {
+            "chunks_added": 0,
+            "source": file_path,
+            "document_name": os.path.basename(file_path),
+            "status": "skipped_duplicate"
+        }
 
     chunks = chunk_text(text)
 
@@ -39,6 +56,7 @@ def ingest_document(file_path: str):
             embeddings=[embedding],
             metadatas=[{
                 "source": file_path,
+                "content_hash": doc_hash,
                 "document_name": os.path.basename(file_path),
                 "chunk_index": index
             }],
