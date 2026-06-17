@@ -19,13 +19,13 @@ Chunking (300 char chunks)
       ↓
 Embeddings (nomic-embed-text)
       ↓
-ChromaDB (vector storage)
+ChromaDB (vector storage, metadata-aware)
       ↓
-Semantic Search
+Semantic Search (cosine similarity, optional document filter)
       ↓
-Llama 3 (Ollama)
+Llama 3 / 3.1 (Ollama)
       ↓
-Answer
+Answer + Sources + Grounding Verification
 ```
 
 Potential use cases:
@@ -34,6 +34,7 @@ Potential use cases:
 - Compliance and regulatory documentation
 - Healthcare knowledge bases
 - Private enterprise knowledge management
+- Multi-document research across a private corpus
 
 ---
 
@@ -41,11 +42,16 @@ Potential use cases:
 
 - PDF and text document ingestion
 - File upload endpoint for dynamic document ingestion
-- Semantic search using vector embeddings
+- Semantic search using vector embeddings (cosine similarity)
 - ChromaDB as a StatefulSet with persistent storage
 - Local LLM inference using Ollama
 - Declarative model pulling via init container
-- LangGraph agent integration
+- LangGraph agent integration with tool-calling
+- **Source citations on every answer** (`/ask` and `/agent`)
+- **Agent grounding verification** (`tool_was_called`) — proves the agent queried documents instead of answering from training data
+- **Metadata-aware retrieval** — chunks tagged with `document_name` and `chunk_index`, queries filterable to a single document
+- **Document registry endpoint** (`/documents`) — lists every document currently indexed
+- **Retrieval debugging endpoint** (`/debug-search`) — inspect raw retrieval output before generation, to isolate retrieval failures from generation failures
 - RAGAS evaluation framework
 - Kubernetes-native deployment (Kind locally, EKS in production)
 - Docker Compose support for local development
@@ -55,17 +61,18 @@ Potential use cases:
 
 ## RAGAS Evaluation Results
 
-Evaluation performed locally against the sample HR policy corpus.
+Evaluation performed locally against the sample HR policy corpus, using the system's own local Llama 3 as the judge model (no OpenAI dependency).
 
 | Metric            | Score |
-|-------------------|-------|
-| Faithfulness      | 1.00  |
-| Context Precision | 1.00  |
-| Context Recall    | 1.00  |
-| Answer Relevancy  | 0.82  |
+|--------------------|------|
+| Faithfulness       | 1.00 |
+| Context Precision  | 1.00 |
+| Context Recall     | 1.00 |
+| Answer Relevancy   | 0.82 |
 
-Faithfulness of 1.00 means every answer came from the document, not hallucination.
-Answer Relevancy of 0.82 indicates room to improve chunking strategy for more precise retrieval.
+Faithfulness of 1.00 means every answer was supported by the retrieved document content, not hallucinated. Answer Relevancy of 0.82 indicates room to improve chunking strategy for more precise retrieval.
+
+This evaluation currently covers the `/ask` endpoint only. Extending it to cover `/agent` and the trading-strategy document is on the roadmap (see below) — early manual testing surfaced an inconsistent-faithfulness issue in agent generation, addressed under Key Engineering Decisions.
 
 ---
 
@@ -74,7 +81,7 @@ Answer Relevancy of 0.82 indicates room to improve chunking strategy for more pr
 ```
 User
   ↓
-POST /upload or /ask or /agent
+POST /upload, /ask, /agent, /debug-search, GET /documents
   ↓
 FastAPI Deployment (rag-app)
   ↓              ↓
@@ -86,14 +93,14 @@ PVC Storage (persistent)
 
 ### Kubernetes Components
 
-| Component      | Resource    | Why                                              |
-|----------------|-------------|--------------------------------------------------|
-| FastAPI API    | Deployment  | Stateless, pods are interchangeable              |
-| Ollama         | Deployment  | Stateless server, models stored on PVC           |
-| ChromaDB       | StatefulSet | Stateful, needs stable identity and storage      |
-| Chroma Storage | PVC 5GB     | Survives pod restarts                            |
-| Ollama Storage | PVC 10GB    | Models persist across pod restarts               |
-| Model Puller   | Init Container | Declarative model pulling on pod start        |
+| Component       | Resource        | Why                                          |
+|-------------------|------------------|-----------------------------------------------|
+| FastAPI API      | Deployment       | Stateless, pods are interchangeable            |
+| Ollama           | Deployment       | Stateless server, models stored on PVC         |
+| ChromaDB         | StatefulSet      | Stateful, needs stable identity and storage    |
+| Chroma Storage   | PVC 5GB          | Survives pod restarts                          |
+| Ollama Storage   | PVC 10GB         | Models persist across pod restarts             |
+| Model Puller     | Init Container   | Declarative model pulling on pod start         |
 
 ### Why StatefulSet for Chroma
 
@@ -101,7 +108,7 @@ Kubernetes Deployments are for stateless apps. Pods are interchangeable and star
 
 ### Why Recreate Strategy for Ollama
 
-Ollama uses a PVC with `ReadWriteOnce` access mode, meaning only one pod can mount it at a time. The default `RollingUpdate` strategy tries to start a new pod before killing the old one. Both pods fight over the same PVC and the new pod gets stuck Pending. `Recreate` strategy kills the old pod first, then starts the new one. Solves the conflict.
+Ollama uses a PVC with `ReadWriteOnce` access mode, meaning only one pod can mount it at a time. The default `RollingUpdate` strategy tries to start a new pod before killing the old one. Both pods fight over the same PVC and the new pod gets stuck Pending. `Recreate` strategy kills the old pod first, then starts the new one.
 
 ```yaml
 strategy:
@@ -114,16 +121,10 @@ strategy:
 
 ### Declarative Model Pulling
 
-Bad approach — Kubernetes Job:
-```
-Job runs once
-Models download into ephemeral pod storage
-Pod restarts
-Models gone
-Manual re-pull required
-```
+Bad approach — Kubernetes Job: runs once, models download into ephemeral pod storage, pod restarts, models gone, manual re-pull required.
 
-Good approach — Init Container in Ollama Deployment:
+Good approach — Init Container in the Ollama Deployment:
+
 ```yaml
 initContainers:
 - name: pull-models
@@ -134,6 +135,7 @@ initContainers:
       ollama serve &
       sleep 5
       ollama pull llama3
+      ollama pull llama3.1
       ollama pull nomic-embed-text
       kill %1
   volumeMounts:
@@ -145,20 +147,9 @@ Every pod restart runs the init container first. If models are already in the PV
 
 ### The PORT Environment Variable Conflict
 
-When you name a Kubernetes Service `chroma` running on port 8000, Kubernetes automatically injects this into every pod in the namespace:
+Naming a Kubernetes Service `chroma` on port 8000 causes Kubernetes to auto-inject `PORT=tcp://10.96.149.181:8000` into every pod in the namespace. ChromaDB's backend expects `PORT` as a plain integer and panics on the injected string.
 
-```
-PORT=tcp://10.96.149.181:8000
-```
-
-ChromaDB's Rust backend expects PORT to be a plain number like `8000`. It receives the full TCP string and panics:
-
-```
-Error loading config: invalid type: found string "tcp://10.96.149.181:8000",
-expected u16 for key "PORT"
-```
-
-Fix — explicitly override PORT in the StatefulSet env block:
+Fix — explicitly override in the StatefulSet env block:
 
 ```yaml
 env:
@@ -170,54 +161,32 @@ env:
   value: "8000"
 ```
 
-Lesson: Kubernetes injects environment variables automatically for service discovery. Variable names like `PORT`, `HOST`, and `USER` can conflict with what your application expects.
+Lesson: Kubernetes injects environment variables automatically for service discovery. Generic variable names (`PORT`, `HOST`, `USER`) can silently collide with what an application expects.
 
 ### python-multipart and Why It Breaks in Kubernetes
 
-FastAPI requires `python-multipart` to handle file uploads. On your Mac, it may already be installed as a side effect of other packages. Inside a Docker container, only what is explicitly in `requirements.txt` gets installed.
+FastAPI requires `python-multipart` to handle file uploads. It may already exist on a local machine as a side effect of other installed packages, but inside a container, only what's explicitly listed in `requirements.txt` gets installed. Missing it crashes the upload endpoint with `RuntimeError: Form data requires "python-multipart"`.
 
-If missing, the upload endpoint crashes with:
-```
-RuntimeError: Form data requires "python-multipart"
-```
-
-Fix: add it to `requirements.txt` before building the image.
-
-Lesson: your local machine is not a clean environment. Docker containers are. Always test with a fresh container before deploying.
+Lesson: a local machine is not a clean environment. Always test with a fresh container before deploying.
 
 ### LangGraph Tool Calling Model Requirement
 
-LangGraph agents require a model that supports tool calling. `llama3` (original) does not support tools and returns:
+LangGraph agents require a model that supports tool calling. `llama3` (original) does not and returns `llama3 does not support tools (status code: 400)`. Models that do: `llama3.1`, `llama3.2`, `llama3.3`.
 
-```
-llama3 does not support tools (status code: 400)
-```
+### Memory Requirements for the LangGraph Agent
 
-Models that support tool calling: `llama3.1`, `llama3.2`, `llama3.3`.
-
-### Memory Requirements for LangGraph Agent
-
-LangGraph agents make multiple sequential LLM calls per request (reasoning + tool call + synthesis). On an Intel Mac with limited Docker Desktop memory allocation, this causes OOMKill:
+LangGraph agents make multiple sequential LLM calls per request (reasoning, tool call, synthesis). On an Intel Mac with limited Docker Desktop memory, this caused OOMKill inside Kind:
 
 ```
 kind cluster + Ollama + llama3.1 + Chroma + FastAPI + LangGraph
-= exceeds available memory on 7GB Docker allocation
+= exceeds available memory on a 7GB Docker allocation
 ```
 
-Fix for local development: increase Docker Desktop memory to 16-20GB (safe on a 32GB Mac).
-
-Production fix: EKS with a GPU node (`g4dn.xlarge`). Agent runs in under 10 seconds with GPU acceleration.
+Local fix: moved local agent testing to Docker Compose, removing the Kubernetes-in-Docker overhead layer entirely. Production fix: EKS with a GPU node (`g4dn.xlarge`).
 
 ### Kubernetes DNS — Inside vs Outside the Cluster
 
-Service names resolve inside the cluster only:
-
-```
-chroma  → resolves to Chroma pod IP inside the cluster
-ollama  → resolves to Ollama pod IP inside the cluster
-```
-
-From your Mac, these hostnames do not resolve. Always port-forward to access services locally:
+Service names (`chroma`, `ollama`) resolve inside the cluster only. From a local machine, they don't resolve — always port-forward to reach services locally:
 
 ```bash
 kubectl port-forward svc/chroma 8001:8000
@@ -226,50 +195,95 @@ kubectl port-forward deploy/rag-app 8000:8000
 
 ### Environment Variables vs Hardcoded Paths
 
-Bad:
 ```python
+# Bad
 client = chromadb.PersistentClient(path="./chroma_db")
-```
 
-Good:
-```python
+# Good
 import os
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/data/chroma_db")
 client = chromadb.PersistentClient(path=CHROMA_PATH)
 ```
 
-Same principle as Terraform variables and Kubernetes ConfigMaps. Configuration separated from code. Works in every environment without changing the application.
+Same principle as Terraform variables and Kubernetes ConfigMaps — configuration separated from code, so the same image runs unmodified in every environment.
 
 ### Chunking Strategy
 
-Documents are split into 300-character chunks. Chunk size directly affects answer quality:
+Documents are split into 300-character chunks. Too large and Chroma retrieves irrelevant sections that confuse the model; too small and important context gets cut off mid-sentence. 300 characters is a reasonable baseline for short policy documents; legal documents with long clauses likely need 500–800. The 0.82 Answer Relevancy score suggests this is worth revisiting — semantic chunking instead of fixed character splits is on the roadmap.
 
-- Too large → Chroma retrieves irrelevant sections, confuses the model
-- Too small → important context gets cut off mid-sentence
-- 300 characters → good baseline for short policy documents
-- 500-800 characters → better for legal documents with long clauses
+### Generation Inconsistency: Temperature Tuning
 
-RAGAS Answer Relevancy score of 0.82 suggests chunking can be improved. Next iteration will test semantic chunking instead of fixed character splits.
+Manual testing surfaced a faithfulness problem distinct from retrieval. Across repeated identical queries against `/agent`, the same retrieved context sometimes produced a correct, grounded answer and sometimes produced fabricated detail not present in the source (e.g., inventing unrelated trading-indicator explanations for terms that were never defined that way in the document). Retrieval was verified correct and consistent in every run via `/debug-search`; only generation varied.
+
+Root cause: `ChatOllama`'s default non-zero sampling temperature, which is appropriate for creative generation but undesirable for a RAG system whose job is to relay retrieved content faithfully, not embellish it.
+
+Fix:
+
+```python
+llm = ChatOllama(
+    model="llama3.1",
+    base_url="http://ollama:11434",
+    temperature=0
+)
+```
+
+Confirmed consistent, grounded answers across repeated runs after the change.
+
+### Metadata Schema Migration
+
+After adding `document_name` and `chunk_index` to chunk metadata, previously ingested chunks still carried the old schema (`{"source": file_path}` only) and did not retroactively update — changing the ingestion code does not change records already written to the database. `/debug-search` surfaced this directly, returning `document_name: null` on old records.
+
+Since this was disposable development data, the fix was to reset the local volume and re-ingest:
+
+```bash
+docker compose down -v
+docker compose up -d --build
+```
+
+In production, this is the wrong move — wiping a live vector store destroys real data with no rollback. The correct pattern is a versioned collection:
+
+```python
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "private_docs")
+collection = client.get_or_create_collection(
+    name=COLLECTION_NAME,
+    metadata={"hnsw:space": "cosine"}
+)
+```
+
+Migration flow: keep the old collection live, create `private_docs_v2` with the corrected schema, re-index all source documents from S3 into it, validate retrieval via `/debug-search`, switch the application's `COLLECTION_NAME` env var, monitor, then delete the old collection later. Rollback at every step.
+
+### Distance Metric: Cosine vs L2
+
+Chroma defaults to squared L2 distance, not cosine similarity. Computing `relevance_score = 1 - distance` against raw L2 distances on un-normalized embeddings produces meaningless values (observed as large negative numbers). Fix: explicitly set the collection's distance metric at creation time —
+
+```python
+collection = client.get_or_create_collection(
+    name="private_docs",
+    metadata={"hnsw:space": "cosine"}
+)
+```
+
+This only applies going forward; an existing collection's metric can't be changed in place, which is part of why the metadata migration above required a fresh collection rather than an in-place fix.
 
 ---
 
 ## API Reference
 
-### GET /
+### `GET /`
 Health check.
 ```bash
 curl http://localhost:8000/
 # {"status": "running"}
 ```
 
-### POST /upload
-Upload any PDF. Ingests into Chroma automatically.
+### `POST /upload`
+Upload a PDF. Ingests into Chroma automatically, tagged with `document_name`.
 ```bash
 curl -F "file=@contract.pdf" http://localhost:8000/upload
 # {"filename": "contract.pdf", "chunks_added": 39, "status": "ingested"}
 ```
 
-### POST /ingest
+### `POST /ingest`
 Ingest a file already inside the container.
 ```bash
 curl -X POST http://localhost:8000/ingest \
@@ -277,37 +291,65 @@ curl -X POST http://localhost:8000/ingest \
   -d '{"file_path": "app/data/policy.txt"}'
 ```
 
-### POST /ask
-Fixed RAG pipeline. Always searches documents.
+### `GET /documents`
+List every document currently indexed in the vector store. Powers document-selector UI.
+```bash
+curl http://localhost:8000/documents
+# {"documents": ["policy.txt", "Reggie_MGC_Trading_Strategy.pdf"]}
+```
+
+### `POST /ask`
+Deterministic RAG pipeline. Always searches documents. Accepts an optional `document_name` to constrain retrieval to a single file.
 ```bash
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "How many vacation days do employees get?"}'
+  -d '{"question": "How many vacation days do employees get?", "document_name": "policy.txt"}'
 # {
 #   "question": "...",
 #   "route": "local_ollama_private_rag",
 #   "answer": "...",
+#   "sources": [{"document": "policy.txt", "excerpt": "...", "relevance_score": 0.91}],
 #   "retrieved_chunks": ["..."]
 # }
 ```
 
-### POST /agent
-LangGraph agent. LLM decides whether to call the document search tool.
+### `POST /agent`
+LangGraph agent. The LLM decides whether to call the document search tool, and can reason across multiple steps. Returns grounding verification.
 ```bash
 curl -X POST http://localhost:8000/agent \
   -H "Content-Type: application/json" \
-  -d '{"question": "Summarize the vacation policy"}'
+  -d '{"question": "What are the four gates for entry?"}'
 # {
 #   "question": "...",
 #   "route": "langgraph_agent",
-#   "answer": "..."
+#   "answer": "...",
+#   "sources": [...],
+#   "tool_was_called": true
 # }
 ```
 
-The difference between /ask and /agent:
+`tool_was_called: false` with a confident-sounding answer is the signature of the silent-failure case: the agent skipped retrieval and answered from training data instead of the actual document. This field exists specifically to catch that.
+
+### `POST /debug-search`
+Raw retrieval output, no generation step. Used to isolate retrieval failures from generation failures before debugging a hallucination.
+```bash
+curl -X POST http://localhost:8000/debug-search \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What are the four gates for entry?"}'
+# {
+#   "query": "...",
+#   "top_chunks": ["..."],
+#   "scores": [0.6654, 0.521, 0.492],
+#   "metadatas": [{"document_name": "Reggie_MGC_Trading_Strategy.pdf", "chunk_index": 12}, ...]
+# }
 ```
-/ask   → deterministic, always searches documents
-/agent → LLM decides what tool to use, can reason across multiple steps
+
+### Endpoint comparison
+
+```
+/ask          → deterministic, always searches documents
+/agent        → LLM decides whether/what tool to call, can reason across steps
+/debug-search → retrieval only, no LLM generation — for diagnosing where a failure lives
 ```
 
 ---
@@ -319,13 +361,14 @@ local-rag-api/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              ← FastAPI routes
-│   ├── rag.py               ← RAG pipeline logic
-│   ├── agent.py             ← LangGraph agent
+│   ├── rag.py               ← RAG pipeline + metadata-aware retrieval + debug search
+│   ├── agent.py             ← LangGraph agent, temperature=0
 │   ├── ollama_client.py     ← Ollama API calls
 │   └── data/
 │       └── policy.txt       ← Sample HR policy document
 ├── eval/
-│   └── ragas_eval.py        ← RAGAS evaluation script
+│   ├── ragas_eval.py        ← RAGAS evaluation script (covers /ask)
+│   └── evaluate_retrieval.py ← Retrieval-accuracy pass/fail harness (covers document routing)
 ├── Dockerfile
 ├── docker-compose.yml       ← Local development
 ├── requirements.txt
@@ -338,7 +381,7 @@ local-rag-api/
 
 ## Local Development with Docker Compose
 
-Compose removes the Kubernetes overhead layer for faster local iteration:
+Compose removes the Kubernetes-in-Docker overhead layer for faster local iteration, and was specifically what unblocked LangGraph agent testing after Kind ran out of memory.
 
 ```bash
 docker compose up -d
@@ -347,7 +390,6 @@ docker compose exec ollama ollama pull llama3.1
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 
-Test:
 ```bash
 curl -F "file=@document.pdf" http://localhost:8000/upload
 curl -X POST http://localhost:8000/ask \
@@ -360,25 +402,20 @@ curl -X POST http://localhost:8000/ask \
 ## Kubernetes Deployment (Kind — Local)
 
 ```bash
-# Create cluster
 kind create cluster --name rag-dev
 
-# Build and load image
 docker build -t rag-app:latest .
 kind load docker-image rag-app:latest --name rag-dev
 
-# Deploy
 kubectl apply -f chroma-statefulset.yaml
 kubectl apply -f ollama-deployment.yaml
 kubectl apply -f rag-app-deployment.yaml
 
-# Verify
 kubectl get pods
 # chroma-0     Running
 # ollama-xxx   Running
 # rag-app-xxx  Running
 
-# Access
 kubectl port-forward deploy/rag-app 8000:8000
 ```
 
@@ -386,21 +423,21 @@ kubectl port-forward deploy/rag-app 8000:8000
 
 ## Technology Stack
 
-| Technology        | Purpose                  |
-|-------------------|--------------------------|
-| FastAPI           | API layer                |
-| ChromaDB          | Vector database          |
-| Ollama            | Local LLM server         |
-| Llama 3           | Language model           |
-| Llama 3.1/3.2     | Tool-calling agent model |
-| nomic-embed-text  | Embedding model          |
-| LangGraph         | Agent framework          |
-| pypdf             | PDF text extraction      |
-| python-multipart  | File upload handling     |
-| Docker            | Containerization         |
-| Kind              | Local Kubernetes         |
-| Kubernetes        | Orchestration            |
-| RAGAS             | RAG evaluation           |
+| Technology         | Purpose                    |
+|----------------------|------------------------------|
+| FastAPI             | API layer                   |
+| ChromaDB             | Vector database              |
+| Ollama               | Local LLM server             |
+| Llama 3              | Language model                |
+| Llama 3.1/3.2        | Tool-calling agent model      |
+| nomic-embed-text     | Embedding model               |
+| LangGraph            | Agent framework               |
+| pypdf                | PDF text extraction           |
+| python-multipart     | File upload handling          |
+| Docker               | Containerization               |
+| Kind                 | Local Kubernetes               |
+| Kubernetes           | Orchestration                  |
+| RAGAS                | RAG evaluation                 |
 
 ---
 
@@ -409,10 +446,16 @@ kubectl port-forward deploy/rag-app 8000:8000
 ### Built
 - End-to-end private RAG system from scratch
 - File upload endpoint for dynamic document ingestion
-- ChromaDB StatefulSet with persistent volume
+- ChromaDB StatefulSet with persistent volume, explicit cosine distance metric
 - Ollama with declarative model pulling via init container
-- LangGraph agent wrapping RAG as a tool
+- LangGraph agent wrapping RAG as a tool, with temperature tuned for faithful generation
+- Source citation system on every answer, for retrieval transparency
+- Agent grounding verification (`tool_was_called`) to detect silent tool-skip failures
+- Metadata-aware retrieval with per-document filtering
+- Document registry endpoint for frontend document selection
+- Retrieval debugging endpoint to separate retrieval failures from generation failures
 - RAGAS evaluation pipeline
+- Retrieval-accuracy evaluation harness with pass/fail output
 - Full Kubernetes multi-pod architecture
 
 ### Learned
@@ -422,13 +465,15 @@ kubectl port-forward deploy/rag-app 8000:8000
 - Declarative vs imperative operations in Kubernetes
 - Kubernetes DNS and service-to-service communication
 - Why environment variables conflict with Kubernetes service injection
-- async/await in FastAPI and why it matters for concurrent uploads
 - Configuration separated from code using environment variables
 - LangGraph tool calling and model requirements
 - Memory constraints for LLM inference in containerized environments
 - RAGAS metrics and what each score means for RAG quality
-- ⏳ Docker Compose — setting up now
-- ⬜ Test LangGraph agent (blocked by memory on Kind)
+- Cosine vs L2 distance and why the metric must be set explicitly at collection creation
+- Why changing ingestion code does not retroactively change already-stored vector records, and why production handles this with a versioned collection and re-index job rather than a destructive reset
+- Sampling temperature's effect on RAG faithfulness, and why zero temperature is the right default for context-grounded generation
+- Why container filesystem paths (`/tmp`) must be used instead of local machine paths, since a container can't see the host filesystem
+
 ---
 
 ## Roadmap
@@ -443,13 +488,325 @@ kubectl port-forward deploy/rag-app 8000:8000
 - [x] LangGraph agent
 - [x] RAGAS evaluation
 - [x] Docker Compose local dev
+- [x] Source citations
+- [x] Agent tool telemetry (`tool_was_called`)
+- [x] Metadata-aware multi-document retrieval
+- [x] Document registry endpoint (`/documents`)
+- [x] Retrieval debugging endpoint (`/debug-search`)
+- [x] Temperature tuning for generation consistency
+- [ ] Retrieval-accuracy evaluation harness across multiple documents (in progress)
+- [ ] Extend RAGAS evaluation to cover `/agent` and the trading-strategy document
+- [ ] Frontend UI: upload, document selector, question box, sources panel, agent toggle
 - [ ] EKS deployment with Terraform
-- [ ] GPU node for agent inference (g4dn.xlarge)
-- [ ] S3 document storage for raw files
+- [ ] GPU node for agent inference (`g4dn.xlarge`)
+- [ ] S3 document storage for raw files, with versioned-collection migration pattern
 - [ ] Hybrid search (vector + keyword)
 - [ ] Reranking for better retrieval
 - [ ] LangSmith observability
-- [ ] Multi-document collections
 - [ ] Authentication and RBAC
 - [ ] Whisper voice ingestion
-- [ ] Frontend UI for non-technical users/
+
+
+
+Things to fit in to reame clealy throu openai or antrhopic 
+LangSmith or Phoenix tracing
+RAGAS evaluations
+Hybrid retrieval
+Reranking
+Authentication
+Usage tracking
+Async ingestion
+Qdrant
+vLLM serving
+EKS deployment
+
+
+
+
+----------
+
+This is much closer to reality than the first "ASI Engineer" post.
+
+I'd say **85–90% accurate** for what senior AI engineers are doing in 2026.
+
+### What's accurate
+
+#### Senior AI engineers don't just write prompts
+
+This is probably the biggest misconception.
+
+Junior people think:
+
+> AI Engineer = Prompt Engineer
+
+Senior people know:
+
+> AI Engineer = Distributed systems engineer with LLMs in the middle.
+
+The hard problems are:
+
+* reliability
+* evaluation
+* observability
+* cost
+* latency
+* security
+* retrieval quality
+
+not prompt wording.
+
+---
+
+#### RAG optimization is a real senior-level skill
+
+Almost everyone can build:
+
+FastAPI → Chroma → OpenAI/Ollama
+
+in a weekend.
+
+Very few can explain:
+
+* hybrid retrieval
+* reranking
+* parent-child retrieval
+* contextual chunking
+* metadata filtering
+* query expansion
+* evaluation metrics
+
+That's where the value is.
+
+Your current project is actually sitting right at this transition point.
+
+You already have:
+
+* FastAPI
+* Chroma
+* Ollama
+* Kubernetes
+
+The next level is:
+
+```text
+Query
+ ↓
+Hybrid Search
+ ↓
+Top 50 Docs
+ ↓
+Reranker
+ ↓
+Top 5 Docs
+ ↓
+LLM
+ ↓
+Evaluation
+ ↓
+Trace Storage
+```
+
+---
+
+#### Evaluation is becoming mandatory
+
+A year ago people were shipping:
+
+```python
+response = llm.invoke(prompt)
+return response
+```
+
+Today interviewers increasingly ask:
+
+> How do you know your AI system is good?
+
+Expected answers:
+
+* RAGAS
+* Braintrust
+* LangSmith
+* Phoenix
+* custom evaluation datasets
+
+This is one of the biggest differences between junior and senior AI engineers.
+
+---
+
+#### Rate limiting and async architecture
+
+Very real.
+
+A lot of tutorial projects look like:
+
+```python
+user
+ ↓
+fastapi
+ ↓
+openai
+```
+
+Production systems look more like:
+
+```text
+User
+ ↓
+API Gateway
+ ↓
+FastAPI
+ ↓
+Redis Queue
+ ↓
+Workers
+ ↓
+LLM
+ ↓
+Result Store
+```
+
+Or:
+
+```text
+FastAPI
+ ↓
+Celery
+ ↓
+Redis
+ ↓
+Workers
+```
+
+because thousands of concurrent requests will crush a naïve design.
+
+---
+
+### What I'd change
+
+#### "Use few-shot examples to fix hallucinations"
+
+That's only partially true.
+
+Hallucinations are usually addressed through:
+
+1. Better retrieval
+2. Better grounding
+3. Better context
+4. Better model selection
+5. Better evaluation
+
+Few-shot examples help, but they are not the primary fix.
+
+If your retrieval is garbage, few-shot prompting won't save you.
+
+---
+
+#### "Cross-encoder reranker" isn't always necessary
+
+Good answer in an interview.
+
+Bad answer as a universal solution.
+
+A senior engineer would say:
+
+> We measured retrieval quality and added reranking because it improved relevance.
+
+Not:
+
+> Always add a reranker.
+
+Everything should be benchmarked.
+
+---
+
+#### "Senior AI Engineer builds multi-agent systems"
+
+Sometimes.
+
+The internet currently overhypes agents.
+
+Many production systems are still:
+
+```text
+User
+ ↓
+Retriever
+ ↓
+LLM
+ ↓
+Answer
+```
+
+A lot of companies have learned that:
+
+* simple systems
+* fewer moving parts
+* easier debugging
+
+often outperform complicated agent swarms.
+
+---
+
+### For YOU specifically
+
+Looking at what you've already built:
+
+Current level:
+
+```text
+FastAPI
+ ↓
+Chroma
+ ↓
+Ollama
+```
+
+Immediate next skills:
+
+1. LangSmith or Phoenix tracing
+2. RAGAS evaluations
+3. Hybrid retrieval
+4. Reranking
+5. Authentication
+6. Usage tracking
+7. Async ingestion
+8. Qdrant
+9. vLLM serving
+10. EKS deployment
+
+```
+
+If you complete those, you can legitimately discuss:
+
+- retrieval failures
+- vector search tuning
+- evaluation frameworks
+- observability
+- production inference
+
+in interviews.
+
+That's much closer to a real AI Engineer than spending six months studying transformer math.
+
+### The one thing missing
+
+The post barely mentions what separates **senior** from **mid-level**:
+
+**Tradeoffs.**
+
+Senior answers sound like:
+
+> "We tested semantic chunking versus fixed chunks and fixed chunks were cheaper with similar recall, so we kept fixed chunks."
+
+or
+
+> "We removed an agent because latency increased 4× and users didn't see better outcomes."
+
+or
+
+> "We chose Qdrant over Chroma because we needed filtering and clustering at scale."
+
+Anybody can name tools.
+
+Senior engineers explain **why one design was chosen over another and what metrics justified the decision**. That's what interviewers usually probe for.
+```
