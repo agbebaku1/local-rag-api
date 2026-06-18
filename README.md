@@ -49,11 +49,11 @@ Real use cases this is aimed at:
 - LangGraph agent with tool-calling, temperature tuned for faithful generation
 - Source citations on every answer (`/ask` and `/agent`)
 - Agent grounding verification (`tool_was_called`) — proves the agent actually queried documents instead of answering from training data
-- Metadata-aware retrieval — chunks tagged with `document_name`, `chunk_index`, and `content_hash`; queries filterable to a single document
+- Metadata-aware retrieval — chunks tagged with `document_name`, `chunk_index`, and `content_hash`; queries filterable to a single document. **Tested with two real, topically distinct documents** — see Key Engineering Decisions below.
 - Document registry endpoint (`/documents`)
 - Retrieval debugging endpoint (`/debug-search`) — inspect raw retrieval before generation, to separate retrieval failures from generation failures
 - RAGAS evaluation framework
-- A small retrieval-accuracy pass/fail harness (`evaluate_retrieval.py`)
+- A retrieval-accuracy pass/fail harness (`evaluate_retrieval.py`) — 6 test cases across both real documents, 100% accuracy, no filter applied
 - Kubernetes-native deployment (Kind locally; EKS planned)
 - Docker Compose for local development
 - Zero external LLM API dependency
@@ -369,6 +369,29 @@ spec:
     - name: MY_VAR
 ```
 
+### Multi-Document Filtering — Tested for Real
+
+`document_name` filtering existed in code for a while before it was actually exercised with more than one document present. Tested by loading `policy.txt` (via `/ingest`, since it ships baked into the image at `app/data/policy.txt`) alongside the already-ingested `Reggie_MGC_Trading_Strategy.pdf`, then running two real comparisons via `/debug-search`:
+
+1. **No filter, ambiguous-on-purpose question** — "How many vacation days do employees get?" with no `document_name` supplied. Chroma searched across both documents and correctly returned all 3 top chunks from `policy.txt` (relevance scores 0.805, 0.618, 0.532), since that's genuinely the better semantic match. This proves retrieval quality, not filtering.
+2. **Filter deliberately pointed at the wrong document** — same question, this time with `document_name: "Reggie_MGC_Trading_Strategy.pdf"` forced in the request. Chroma returned chunks about prop-firm drawdown rules and funded-account comparisons — completely irrelevant to vacation days — with visibly lower relevance scores (0.459, 0.451, 0.448). This is the real proof: if the filter parameter did nothing, this call would have returned the same `policy.txt` chunks as the unfiltered call. Instead it returned different chunks from a different document with worse scores, which only happens if `where={"document_name": ...}` is genuinely restricting Chroma's candidate pool before scoring.
+
+### Retrieval Evaluation Harness — Expanded and Re-Verified
+
+The original `evaluate_retrieval.py` had 2 test cases, both against the trading PDF — a smoke test confirming the harness ran, not real coverage. With `policy.txt` now loaded alongside it, the harness was expanded to 6 cases (3 per document), all run with no `document_name` filter, to test whether unfiltered retrieval naturally routes each question to the correct document on its own:
+
+```
+Question 1: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
+Question 2: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
+Question 3: PASS (expected policy.txt, got policy.txt)
+Question 4: PASS (expected policy.txt, got policy.txt)
+Question 5: PASS (expected policy.txt, got policy.txt)
+Question 6: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
+Retrieval Accuracy: 100%
+```
+
+Honest scope note: 6 cases across 2 documents is real, meaningful signal — meaningfully stronger than the original 2-case version — but it is not proof this holds at larger document counts or with topically overlapping documents where semantic boundaries get fuzzier. Worth stating that caveat plainly if asked, rather than overselling six passing cases as a comprehensive evaluation.
+
 ### Chunking Strategy
 
 Documents are split into fixed 300-character chunks. Too large and Chroma retrieves irrelevant sections that confuse the model; too small and important context gets cut off mid-sentence. 300 characters is a reasonable baseline for short policy documents; legal documents with long clauses likely need 500–800. RAGAS's 0.82 Answer Relevancy score (below) suggests this is worth revisiting — semantic chunking instead of fixed splits is on the roadmap, not yet built.
@@ -394,13 +417,19 @@ Faithfulness of 1.00 means every answer was supported by retrieved content, not 
 
 A separate, smaller harness measuring something different from RAGAS: not generation quality, but whether retrieval routes to the *correct document* at all. Hits `/debug-search` directly and checks the top-returned chunk's `document_name` against an expected value per test question.
 
+Expanded from an initial 2-case smoke test to 6 cases across both real documents (`policy.txt`, `Reggie_MGC_Trading_Strategy.pdf`), all run unfiltered:
+
 ```
-Question 1: PASS
-Question 2: PASS
+Question 1: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
+Question 2: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
+Question 3: PASS (expected policy.txt, got policy.txt)
+Question 4: PASS (expected policy.txt, got policy.txt)
+Question 5: PASS (expected policy.txt, got policy.txt)
+Question 6: PASS (expected Reggie_MGC_Trading_Strategy.pdf, got Reggie_MGC_Trading_Strategy.pdf)
 Retrieval Accuracy: 100%
 ```
 
-**Honest scope note:** this is currently 2 test cases — a smoke test confirming the harness works, not a real evaluation suite. A defensible version needs more cases, including ones designed to fail (e.g. asking a policy-specific question while only the trading PDF is loaded), to actually prove the harness can detect a wrong match rather than only ever seeing easy correct ones. Not done yet. Also note: this has only ever been run with one document loaded in the collection — the `document_name` filtering logic has never actually been exercised against more than one candidate document.
+**Honest scope note:** 6 cases across 2 real, topically distinct documents is meaningful evidence the retriever can correctly distinguish between unrelated content. It is not proof this holds at larger document counts, or with documents whose topics genuinely overlap (where semantic boundaries get fuzzier and misrouting becomes more likely). Worth stating that distinction plainly if asked, rather than treating six clean passes as a comprehensive evaluation suite.
 
 ---
 
@@ -608,19 +637,22 @@ Note: the LangGraph agent (`/agent`) is memory-constrained under Kind on machine
 - [x] RAGAS evaluation scoring (on `/ask`, HR policy doc)
 - [x] Retrieval-accuracy harness (smoke-test scale, 2 cases)
 
-**Designed, not yet built — pick up here next session:**
+**Designed, not yet built:**
 - [ ] Versioned-collection migration pattern (`private_docs_v2` + `COLLECTION_NAME` env var cutover) — strategy is sound and documented above, implementation not started. Now has two real recurring incidents motivating it (document_name/chunk_index migration, then content_hash migration).
-- [ ] Load a second document (e.g. `policy.txt`) alongside the trading PDF and actually exercise the `document_name` filter on `/ask` and `/debug-search` — this logic exists in code but has never been tested with more than one document in the collection
-- [ ] Expand `evaluate_retrieval.py` beyond 2 cases, including cases designed to fail (e.g. a policy-only question while only the trading PDF is loaded), to prove the harness can actually detect a wrong match
 - [ ] Decide on and possibly implement hash-based chunk IDs (currently still `f"{file_path}-{index}"`) — relevant if a file gets edited in place and re-ingested under the same filename
 - [ ] Extend RAGAS evaluation to cover `/agent` and the trading-strategy document
 
-**Not started:**
+**Next, in order, before EKS:**
+1. [x] **Retrieval evaluation harness** — `evaluate_retrieval.py` expanded from 2 to 6 test cases across both real documents (`policy.txt`, `Reggie_MGC_Trading_Strategy.pdf`), no `document_name` filter applied on any case. Verified with real output inside the container: 6/6 PASS, 100% accuracy. This is meaningfully stronger evidence than the original 2-case smoke test, since it proves the retriever can correctly distinguish between two unrelated documents on its own, not just confirm a single document trivially matches. Caveat to state honestly if asked: 6 cases across 2 documents is real signal, not proof this holds at larger scale or with topically overlapping documents.
+2. [ ] **Better chunking (recursive splitter)** — current chunking is fixed 300-character splits with no awareness of sentence/paragraph boundaries. RAGAS's 0.82 Answer Relevancy score has pointed at this as the likely cause since the very first eval run. Swap in a recursive text splitter (e.g. LangChain's `RecursiveCharacterTextSplitter`) that tries to split on paragraph breaks, then sentences, then words, only falling back to a hard character cut as a last resort. Re-run RAGAS afterward to confirm Answer Relevancy actually improves — don't just assume it will.
+3. [ ] **Hybrid search (BM25 + embeddings)** — pure vector/cosine search can miss exact keyword matches (e.g. an exact term, acronym, or proper noun) that a traditional keyword search would catch instantly. Hybrid search runs both BM25 (classic keyword scoring) and the existing embedding search, then combines/re-ranks the results. Worth testing specifically against questions that use exact terminology from the trading strategy doc (e.g. "CHOCH", "LucidFlex") to see whether pure embeddings already handle those well or whether BM25 adds real lift.
+4. [ ] **Multi-tool agent** — currently `agent.py` gives the LangGraph agent exactly one tool (`search_documents`). A multi-tool agent would let it choose between multiple capabilities per question — for example, document search vs. a calculator tool vs. a date/time tool — which is the actual test of whether `tool_was_called`-style grounding telemetry holds up when there's a real choice to make, not just a single tool to fire or skip.
+
+**Then, after the above:**
 - [ ] EKS deployment with Terraform
 - [ ] GPU node for agent inference (`g4dn.xlarge`)
 - [ ] S3 storage for raw documents
 - [ ] Frontend UI (upload, document selector, question box, sources panel, agent toggle)
-- [ ] Hybrid search (vector + keyword)
 - [ ] Reranking
 - [ ] LangSmith observability
 - [ ] Authentication and RBAC

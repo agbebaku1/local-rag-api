@@ -11,6 +11,22 @@ test_cases = [
         "question": "Which prop firm is the primary funded destination?",
         "expected_doc": "Reggie_MGC_Trading_Strategy.pdf"
     },
+    {
+        "question": "How many vacation days do employees get?",
+        "expected_doc": "policy.txt"
+    },
+    {
+        "question": "What happens if an employee harasses a coworker?",
+        "expected_doc": "policy.txt"
+    },
+    {
+        "question": "When do health benefits begin?",
+        "expected_doc": "policy.txt"
+    },
+    {
+        "question": "What is the stop loss rule for the trading strategy?",
+        "expected_doc": "Reggie_MGC_Trading_Strategy.pdf"
+    },
 ]
 
 passed = 0
