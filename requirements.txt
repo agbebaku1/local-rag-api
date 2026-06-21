@@ -9,3 +9,8 @@ python-multipart
 langgraph
 langchain-ollama
 langchain-core
+ragas
+datasets
+langchain-community
+langchain-google-vertexai
+langchain-google-vertexai

@@ -13,8 +13,40 @@ collection = client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
-def chunk_text(text: str, chunk_size: int = 300) -> list:
-    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+def chunk_text(text: str, chunk_size: int = 300, separators: list = None) -> list:
+    if separators is None:
+        separators = ["\n\n", "\n", ". ", " ", ""]
+
+    separator = separators[0]
+    remaining_separators = separators[1:]
+
+    if separator == "":
+        pieces = list(text)
+    else:
+        pieces = text.split(separator)
+
+    chunks = []
+    current_chunk = ""
+
+    for piece in pieces:
+        candidate = current_chunk + (separator if current_chunk else "") + piece
+
+        if len(candidate) <= chunk_size:
+            current_chunk = candidate
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            if len(piece) > chunk_size and remaining_separators:
+                chunks.extend(chunk_text(piece, chunk_size, remaining_separators))
+                current_chunk = ""
+            else:
+                current_chunk = piece
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 
 

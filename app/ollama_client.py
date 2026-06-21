@@ -15,7 +15,7 @@ def ask_llama(prompt: str) -> str:
     response = requests.post(
         f"{OLLAMA_URL}/chat",
         json={
-            "model": "llama3.1",
+            "model": "llama3",
             "stream": False,
             "messages": [
                 {"role": "system", "content": "Answer only from the provided context. If the answer is not in the context, say you don't know."},

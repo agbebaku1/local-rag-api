@@ -1,4 +1,5 @@
 from ragas import evaluate
+from ragas.run_config import RunConfig
 from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
@@ -36,6 +37,9 @@ eval_questions = [
     }
 ]
 
+# Temporary local smoke test: evaluate one question only.
+eval_questions = eval_questions[:1]
+
 questions = []
 answers = []
 contexts = []
@@ -59,11 +63,19 @@ dataset = Dataset.from_dict({
     "ground_truth": ground_truths
 })
 
+run_config = RunConfig(
+    max_workers=1,
+    timeout=600,
+    max_retries=0,
+)
+
 results = evaluate(
     dataset,
-    metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+    metrics=[faithfulness],
     llm=llm,
-    embeddings=embeddings
+    embeddings=embeddings,
+    run_config=run_config,
+    raise_exceptions=True,
 )
 
 print(results)

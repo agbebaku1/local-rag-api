@@ -21,6 +21,10 @@ class AgentRequest(BaseModel):
 def health_check():
     return {"status": "running"}
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+
 @app.post("/ingest")
 def ingest(request: IngestRequest):
     return ingest_document(request.file_path)
